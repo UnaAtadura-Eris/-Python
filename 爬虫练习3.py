@@ -5,161 +5,174 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import time
+import random
 
-# 解决中文乱码
+# ======================
+# 基础配置（解决乱码/代理）
+# ======================
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+requests.packages.urllib3.disable_warnings()
 
-# 配置（你只改这里！）
-def get_page_url(page_num):
-    # 示例格式：return f"https://你的域名/actors?page={page_num}"
-    # 你把上面换成你真实的分页网址格式
-    return f"https://netflav.com/chinese-sub?page={page_num}"  # ← 改这里！
+# ======================
+# 网站配置（你的目标站）
+# ======================
+BASE_URL = "https://netflav.com"
+PAGE_URL_FORMAT = "https://netflav.com/chinese-sub?page={}"
 
-# 防反爬配置
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://netflav.com/",  # ← 填你网站首页
-    "Connection": "keep-alive"
+# 请求头（极简防反爬）
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36",
+    "Referer": BASE_URL,
 }
 
-# 初始化会话（稳定请求）
-requests.packages.urllib3.disable_warnings()  # 关闭SSL警告
+# 全局存储
+video_list = []  # 先存列表数据
+final_data = []  # 最终完整数据
 session = requests.Session()
 
-# 存储结果
-all_videos = []
-
-# 爬取单页
-def crawl_single_page(page_num):
-    url = get_page_url(page_num)
-    print(f"\n===== 正在爬第 {page_num} 页：{url} =====")
-
-    try:
-        # 发送请求（跳过SSL验证，解决请求失败）
-        response = session.get(
-            url,
-            headers=headers,
-            timeout=10,
-            verify=False,
-            allow_redirects=True
-        )
-        response.raise_for_status()  # 检测请求是否成功
-
-    except Exception as e:
-        print(f"❌ 第{page_num}页请求失败：{str(e)[:60]}")
-        return False
-
-    # 解析HTML（精准匹配你给的结构）
-    soup = BeautifulSoup(response.text, "html.parser")
-   
-    video_cards = soup.select("div.grid_0_cell")
-
-    if not video_cards:
-        print("❌ 本页未找到视频卡片")
-        return False
-
-    # 提取每个视频的信息
-    for card in video_cards:
+# ======================
+# 【优化1】请求重试函数（解决详情页打不开）
+# ======================
+def get_with_retry(url, retries=2):
+    for i in range(retries + 1):
         try:
-            # 视频名字（匹配 class="grid_0_title" 的第一个元素）
-            name = card.select_one(".grid_0_title").get_text(strip=True)
-            # 【新增】提取视频链接（取第一个a标签，避免重复）
-            a_tag = card.select_one("a[href^='/video?id=']")
-            if a_tag:
-                video_href = a_tag.get("href", "")
-                # 拼接完整URL（替换成你的域名）
-                full_url = f"https://netflav.com{video_href}"
-            else:
-                full_url = "无链接"
-            
-            # ======================
-            # 2. 自动进入视频详情页
-            # ======================
-            print(f"  → 进入详情页：{full_url}")
-
-            resp_detail = session.get(
-                full_url,
-                headers=headers,
-                timeout=15,
-                verify=False
-            )
-            s = BeautifulSoup(resp_detail.text, "html.parser")
-
-            # ----------------------
-            # 第三步：爬你想要的内容（举例，你可以自己加）
-            # ----------------------
-             # 标题
-            title = s.select_one(".videodetail_2_title")
-            title = title.get_text(strip=True) if title else name
-
-            # 观看数
-            views = s.select_one(".videodetail_2_views")
-            views = views.get_text(strip=True).replace("觀看數 ：", "") if views else ""
-
-            # 番号
-            code = s.select_one("div:-soup-contains('番號 :') + .videodetail_2_field_values")
-            code = code.get_text(strip=True) if code else ""
-
-            # 发行日期
-            publish_date = s.select_one("div:-soup-contains('發行日期 :') + .videodetail_2_field_values")
-            publish_date = publish_date.get_text(strip=True) if publish_date else ""
-
-            # 女优（多个女优自动拼接）
-            actress_tags = s.select("a.videodetail_2_field_values_clickable[href*='actress=']")
-            actresses = [a.get_text(strip=True) for a in actress_tags]
-            actresses_str = "，".join(actresses)
-
-            # 类别（标签）
-            genre_tags = s.select("a.videodetail_2_field_values_clickable[href*='genre=']")
-            genres = [g.get_text(strip=True) for g in genre_tags]
-            genres_str = "，".join(genres)
-
-
-            all_videos.append({
-                "视频名字": name,
-                "视频链接": full_url,
-                "观看数": views,
-                "番号": code,
-                "发行日期": publish_date,
-                "女优": actresses_str,
-                "类别标签": genres_str
-            })
-            print(f"✅ {name} ")
-
+            resp = session.get(url, headers=HEADERS, timeout=15, verify=False)
+            resp.encoding = "utf-8"
+            resp.raise_for_status()
+            return resp
         except Exception as e:
-            print(f"⚠️  解析单张卡片失败：{str(e)}")
+            if i == retries:
+                return None
+            # 失败后等待，再重试
+            time.sleep(random.uniform(2, 4))
+    return None
+
+# ======================
+# 【优化2】第一步：只爬列表（超快、不触发反爬）
+# ======================
+def crawl_list_page(page_num):
+    url = PAGE_URL_FORMAT.format(page_num)
+    print(f"\n📄 爬列表第 {page_num} 页：{url}")
+    
+    resp = get_with_retry(url)
+    if not resp:
+        print(f"❌ 列表页 {page_num} 请求失败")
+        return False
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    cards = soup.select("div.grid_0_cell")
+
+    if not cards:
+        print("❌ 本页无视频")
+        return False
+
+    count = 0
+    for card in cards:
+        try:
+            # 提取标题+链接
+            title = card.select_one(".grid_0_title").get_text(strip=True) if card.select_one(".grid_0_title") else "无标题"
+            a_tag = card.select_one("a[href^='/video?id=']")
+            link = BASE_URL + a_tag["href"] if a_tag else None
+
+            if link:
+                video_list.append({"标题": title, "链接": link})
+                count += 1
+        except:
             continue
 
-    print(f"✅ 第{page_num}页完成，共抓取 {len(video_cards)} 个视频")
+    print(f"✅ 列表页 {page_num} 完成，抓取 {count} 个视频")
+    # 防封延时（随机1.5~3秒，比固定1秒更安全）
+    time.sleep(random.uniform(1.5, 3))
     return True
 
-# 批量爬多页
-def crawl_all_pages(start_page=1, end_page=10):
-    for page in range(start_page, end_page + 1):
-        crawl_single_page(page)
-        time.sleep(1)  
+# ======================
+# 【优化3】第二步：批量爬详情（自动重试+不重复爬）
+# ======================
+def crawl_detail_info(video):
+    title = video["标题"]
+    link = video["链接"]
+    print(f"\n🎬 爬详情：{title}")
 
-# 保存到Excel（自动创建文件夹）
+    resp = get_with_retry(link)
+    if not resp:
+        print(f"❌ 详情页打开失败，跳过")
+        return None
+
+    s = BeautifulSoup(resp.text, "html.parser")
+    try:
+        # 提取所有字段（兼容无数据情况）
+        detail_title = s.select_one(".videodetail_2_title").get_text(strip=True) if s.select_one(".videodetail_2_title") else title
+        views = s.select_one(".videodetail_2_views").get_text(strip=True).replace("觀看數 ：", "") if s.select_one(".videodetail_2_views") else ""
+        code = s.select_one("div:-soup-contains('番號 :') + .videodetail_2_field_values").get_text(strip=True) if s.select_one("div:-soup-contains('番號 :') + .videodetail_2_field_values") else ""
+        publish_date = s.select_one("div:-soup-contains('發行日期 :') + .videodetail_2_field_values").get_text(strip=True) if s.select_one("div:-soup-contains('發行日期 :') + .videodetail_2_field_values") else ""
+        
+        # 女优+标签
+        actresses = [a.get_text(strip=True) for a in s.select("a.videodetail_2_field_values_clickable[href*='actress=']")]
+        genres = [g.get_text(strip=True) for g in s.select("a.videodetail_2_field_values_clickable[href*='genre=']")]
+
+        return {
+            "标题": detail_title,
+            "链接": link,
+            "观看数": views,
+            "番号": code,
+            "发行日期": publish_date,
+            "女优": "，".join(actresses),
+            "类别": "，".join(genres)
+        }
+    except:
+        return None
+
+# ======================
+# 【优化4】批量执行+自动保存
+# ======================
+def run_crawler(start_page, end_page):
+    # 第一步：爬所有列表
+    print("="*50)
+    print("🚀 开始爬取列表页...")
+    print("="*50)
+    for page in range(start_page, end_page+1):
+        crawl_list_page(page)
+
+    print(f"\n🎉 列表爬取完成！共获取 {len(video_list)} 个视频")
+    
+    # 第二步：爬详情
+    print("\n" + "="*50)
+    print("🎥 开始爬取详情页（慢稳防封）...")
+    print("="*50)
+    
+    success = 0
+    for video in video_list:
+        data = crawl_detail_info(video)
+        if data:
+            final_data.append(data)
+            success += 1
+        # 【关键】详情页加长延时，彻底解决打不开问题
+        time.sleep(random.uniform(1, 2))
+
+    # 保存结果
+    save_to_excel()
+    print(f"\n🏁 全部完成！成功爬取 {success}/{len(video_list)} 个视频")
+
+# ======================
+# 保存Excel
+# ======================
 def save_to_excel():
-    if not all_videos:
-        print("❌ 没有可保存的数据")
+    if not final_data:
+        print("❌ 无数据可保存")
         return
-
-    # 自动创建output文件夹
+    
     if not os.path.exists("output"):
         os.mkdir("output")
+    
+    df = pd.DataFrame(final_data)
+    path = "output/netflav_完整数据.xlsx"
+    df.to_excel(path, index=False)
+    print(f"\n📁 已保存到：{os.path.abspath(path)}")
 
-    # 保存Excel
-    df = pd.DataFrame(all_videos)
-    excel_path = "output/netflav_videos.xlsx"
-    df.to_excel(excel_path, index=False)
-    print(f"\n🎉 全部完成！共抓取 {len(all_videos)} 个视频数据")
-    print(f"📁 数据已保存到：{os.path.abspath(excel_path)}")
-
-# 主程序入口
+# ======================
+# 主程序
+# ======================
 if __name__ == "__main__":
-    # 你可以改这里的起始页和结束页
-    crawl_all_pages(start_page=1, end_page=10)  # 比如爬1-5页
-    save_to_excel()
+    # 配置爬取页数（建议一次别爬10页，先爬3页测试）
+    run_crawler(start_page=1, end_page=3)
